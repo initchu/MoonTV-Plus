@@ -464,7 +464,8 @@ function PlayPageClient() {
       const validEpisodes = episodes.filter((episode) => episode);
       if (validEpisodes.length === 0) {
         setDownloading(false);
-        setDownloadError('没有选择有效的剧集');
+        setDownloadStatus('error');
+        setDownloadErrorMessage('没有选择有效的剧集');
         return;
       }
       // 只保留有效剧集对应的标题
