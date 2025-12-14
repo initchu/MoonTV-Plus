@@ -64,8 +64,8 @@ function HomeClient() {
       try {
         setLoading(true);
 
-        // 并行获取热门电影、热门剧集和热门综艺
-        const [moviesData, tvShowsData, varietyShowsData] = await Promise.all([
+        // 并行获取热门电影、热门剧集和热门综艺，使用 allSettled 确保单个请求失败不影响其他请求
+        const results = await Promise.allSettled([
           getDoubanCategories({
             kind: 'movie',
             category: '热门',
@@ -75,16 +75,28 @@ function HomeClient() {
           getDoubanCategories({ kind: 'tv', category: 'show', type: 'show' }),
         ]);
 
-        if (moviesData.code === 200) {
-          setHotMovies(moviesData.list);
+        // 处理热门电影结果
+        if (
+          results[0].status === 'fulfilled' &&
+          results[0].value.code === 200
+        ) {
+          setHotMovies(results[0].value.list);
         }
 
-        if (tvShowsData.code === 200) {
-          setHotTvShows(tvShowsData.list);
+        // 处理热门剧集结果
+        if (
+          results[1].status === 'fulfilled' &&
+          results[1].value.code === 200
+        ) {
+          setHotTvShows(results[1].value.list);
         }
 
-        if (varietyShowsData.code === 200) {
-          setHotVarietyShows(varietyShowsData.list);
+        // 处理热门综艺结果
+        if (
+          results[2].status === 'fulfilled' &&
+          results[2].value.code === 200
+        ) {
+          setHotVarietyShows(results[2].value.list);
         }
       } catch (error) {
         console.error('获取豆瓣数据失败:', error);
