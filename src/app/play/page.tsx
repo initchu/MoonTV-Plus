@@ -222,6 +222,10 @@ function PlayPageClient() {
     string | null
   >(null);
 
+  // 选择下载相关状态
+  const [showSelectDownload, setShowSelectDownload] = useState(false);
+  const [selectedEpisodes, setSelectedEpisodes] = useState<number[]>([]);
+
   // 下载控制器，用于暂停/恢复下载
   const downloadControllerRef = useRef<AbortController | null>(null);
 
@@ -382,6 +386,119 @@ function PlayPageClient() {
     }
 
     setShowDownloadProgress(false);
+  };
+
+  // 打开选择下载对话框
+  const handleOpenSelectDownload = () => {
+    setSelectedEpisodes([]);
+    setShowSelectDownload(true);
+  };
+
+  // 关闭选择下载对话框
+  const handleCloseSelectDownload = () => {
+    setShowSelectDownload(false);
+  };
+
+  // 切换集数选择状态
+  const handleToggleEpisodeSelect = (episodeIndex: number) => {
+    setSelectedEpisodes((prev) => {
+      if (prev.includes(episodeIndex)) {
+        return prev.filter((index) => index !== episodeIndex);
+      } else {
+        return [...prev, episodeIndex].sort((a, b) => a - b);
+      }
+    });
+  };
+
+  // 全选/取消全选
+  const handleToggleSelectAll = () => {
+    if (!detail || !detail.episodes) return;
+
+    if (selectedEpisodes.length === detail.episodes.length) {
+      // 取消全选
+      setSelectedEpisodes([]);
+    } else {
+      // 全选
+      setSelectedEpisodes(
+        Array.from({ length: detail.episodes.length }, (_, i) => i)
+      );
+    }
+  };
+
+  // 处理选择下载
+  const handleSelectDownload = async () => {
+    if (!detail || !detail.episodes || selectedEpisodes.length === 0) return;
+
+    try {
+      // 如果正在下载，先暂停
+      if (downloadStatus === 'downloading') {
+        handlePauseDownload();
+        return;
+      }
+
+      // 如果已经暂停，恢复下载
+      if (downloadStatus === 'paused') {
+        handleResumeDownload();
+        return;
+      }
+
+      setDownloading(true);
+      setDownloadStatus('downloading');
+      setShowDownloadProgress(true);
+      setShowSelectDownload(false);
+      setDownloadErrorMessage(null);
+      setDownloadCurrentEpisode(0);
+      setDownloadTotalEpisodes(selectedEpisodes.length);
+      setDownloadProgress(0);
+
+      // 创建新的控制器
+      downloadControllerRef.current = new AbortController();
+      const signal = downloadControllerRef.current.signal;
+
+      const baseFilename = `${detail.title}`;
+      // 只下载选中的集数
+      const episodes = selectedEpisodes.map(
+        (index) => detail.episodes?.[index] ?? ''
+      );
+      // 过滤掉可能的undefined值
+      const validEpisodes = episodes.filter((episode) => episode);
+      if (validEpisodes.length === 0) {
+        setDownloading(false);
+        setDownloadError('没有选择有效的剧集');
+        return;
+      }
+      // 只保留有效剧集对应的标题
+      const validTitles = selectedEpisodes
+        .map((index, idx) => (validEpisodes[idx] ? `第${index + 1}集` : null))
+        .filter(Boolean) as string[];
+
+      await downloadPlaylist(
+        validEpisodes,
+        validTitles,
+        baseFilename,
+        (currentEpisode, totalEpisodes, episodeProgress) => {
+          setDownloadCurrentEpisode(currentEpisode);
+          setDownloadTotalEpisodes(totalEpisodes);
+          setDownloadProgress(episodeProgress);
+        },
+        signal
+      );
+
+      setDownloadStatus('completed');
+      setTimeout(() => {
+        setShowDownloadProgress(false);
+        setDownloading(false);
+      }, 3000);
+    } catch (error) {
+      if (downloadStatus !== 'paused') {
+        console.error('下载合集失败:', error);
+        setDownloadStatus('error');
+        setDownloadErrorMessage(
+          error instanceof Error ? error.message : '下载合集失败'
+        );
+      }
+      setDownloading(false);
+    }
   };
 
   // -----------------------------------------------------------------------------
@@ -2120,6 +2237,17 @@ function PlayPageClient() {
                         : `下载全部 (${detail.episodes.length}集)`}
                     </button>
                   )}
+
+                  {/* 选择下载按钮 */}
+                  {detail && detail.episodes.length > 1 && (
+                    <button
+                      onClick={handleOpenSelectDownload}
+                      className='flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-green-500 to-teal-600 text-white rounded-lg font-medium hover:from-green-600 hover:to-teal-700 transform hover:scale-105 transition-all duration-200 shadow-lg hover:shadow-xl'
+                    >
+                      <Download size={18} />
+                      选择下载
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -2321,6 +2449,76 @@ function PlayPageClient() {
                 >
                   {downloadStatus === 'completed' ? '完成' : '关闭'}
                 </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 选择下载对话框 */}
+      {showSelectDownload && detail && detail.episodes && (
+        <div className='fixed inset-0 bg-black/70 backdrop-blur-sm z-[1000] flex items-center justify-center p-4'>
+          <div className='bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-3xl w-full mx-auto overflow-hidden'>
+            {/* 弹窗头部 */}
+            <div className='p-6 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between'>
+              <h2 className='text-xl font-bold text-gray-900 dark:text-white'>
+                选择下载集数
+              </h2>
+              <button
+                onClick={handleCloseSelectDownload}
+                className='text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors'
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* 弹窗内容 */}
+            <div className='p-6'>
+              {/* 全选/取消全选按钮 */}
+              <div className='flex items-center justify-between mb-6'>
+                <button
+                  onClick={handleToggleSelectAll}
+                  className='flex items-center gap-2 px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg font-medium hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors'
+                >
+                  <span>
+                    {selectedEpisodes.length === detail.episodes.length
+                      ? '取消全选'
+                      : '全选'}
+                  </span>
+                  <span className='text-sm opacity-70'>
+                    ({selectedEpisodes.length} / {detail.episodes.length})
+                  </span>
+                </button>
+                <button
+                  onClick={handleSelectDownload}
+                  disabled={selectedEpisodes.length === 0}
+                  className='flex items-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg font-medium hover:bg-green-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed'
+                >
+                  <Download size={18} />
+                  开始下载
+                </button>
+              </div>
+
+              {/* 集数选择网格 */}
+              <div className='grid grid-cols-8 md:grid-cols-12 gap-2 max-h-[400px] overflow-y-auto'>
+                {detail.episodes.map((_, episodeIndex) => {
+                  const isSelected = selectedEpisodes.includes(episodeIndex);
+                  return (
+                    <button
+                      key={episodeIndex}
+                      onClick={() => handleToggleEpisodeSelect(episodeIndex)}
+                      className={`py-2 px-3 rounded-lg font-medium transition-all duration-200 text-sm flex items-center justify-center
+                        ${
+                          isSelected
+                            ? 'bg-green-500 text-white shadow-lg shadow-green-500/25 dark:bg-green-600'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300 hover:scale-105 dark:bg-white/10 dark:text-gray-300 dark:hover:bg-white/20'
+                        }
+                      `}
+                    >
+                      {episodeIndex + 1}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>
