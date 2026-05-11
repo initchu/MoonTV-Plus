@@ -13,6 +13,7 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
+import { runSpeedtestInBackground } from '@/lib/utils';
 import { yellowWords } from '@/lib/yellow';
 
 import PageLayout from '@/components/PageLayout';
@@ -166,6 +167,9 @@ function SearchPageClient() {
         `/api/search?q=${encodeURIComponent(query.trim())}`
       );
       const data = await response.json();
+
+      // 搜索结果返回后，后台静默触发站点测速（有缓存则跳过）
+      runSpeedtestInBackground();
       let results = data.results;
       if (
         typeof window !== 'undefined' &&

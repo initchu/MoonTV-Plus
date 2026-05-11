@@ -10,7 +10,12 @@ import React, {
 } from 'react';
 
 import { SearchResult } from '@/lib/types';
-import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
+import {
+  getCachedSpeedtest,
+  getVideoResolutionFromM3u8,
+  processImageUrl,
+  sortSourcesBySpeedCache,
+} from '@/lib/utils';
 
 // 定义视频信息类型
 interface VideoInfo {
@@ -459,8 +464,13 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
             !sourceSearchError &&
             availableSources.length > 0 && (
               <div className='flex-1 overflow-y-auto space-y-2 pb-20'>
-                {availableSources
-                  .sort((a, b) => {
+                {(() => {
+                  // 优先用服务端测速缓存排序，再把当前源置顶
+                  const speedCache = getCachedSpeedtest();
+                  const sorted = speedCache
+                    ? sortSourcesBySpeedCache(availableSources, speedCache)
+                    : [...availableSources];
+                  return sorted.sort((a, b) => {
                     const aIsCurrent =
                       a.source?.toString() === currentSource?.toString() &&
                       a.id?.toString() === currentId?.toString();
@@ -470,7 +480,8 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                     if (aIsCurrent && !bIsCurrent) return -1;
                     if (!aIsCurrent && bIsCurrent) return 1;
                     return 0;
-                  })
+                  });
+                })()
                   .map((source, index) => {
                     const isCurrentSource =
                       source.source?.toString() === currentSource?.toString() &&
@@ -490,7 +501,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                       >
                         {/* 封面 */}
                         <div className='flex-shrink-0 w-12 h-20 bg-gray-300 dark:bg-gray-600 rounded overflow-hidden'>
-                          {source.episodes && source.episodes.length > 0 && (
+                          {source.poster && (
                             <img
                               src={processImageUrl(source.poster)}
                               alt={source.title}

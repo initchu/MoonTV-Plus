@@ -4,14 +4,7 @@
 
 import Artplayer from 'artplayer';
 import Hls from 'hls.js';
-import {
-  AlertCircle,
-  CheckCircle,
-  Download,
-  Heart,
-  PauseCircle as Pause,
-  X,
-} from 'lucide-react';
+import { AlertCircle, CheckCircle, Download, Heart, X } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
 
@@ -32,8 +25,11 @@ import { SearchResult } from '@/lib/types';
 import {
   downloadPlaylist,
   downloadVideo,
+  getCachedSpeedtest,
   getVideoResolutionFromM3u8,
   processImageUrl,
+  runSpeedtestInBackground,
+  sortSourcesBySpeedCache,
 } from '@/lib/utils';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
@@ -208,298 +204,154 @@ function PlayPageClient() {
 
   // ----------------------------------------------------------------------------- 下载相关状态
   // -----------------------------------------------------------------------------
-  const [showDownloadProgress, setShowDownloadProgress] = useState(false);
-  const [downloading, setDownloading] = useState(false);
+  // 下载对话框：'none' | 'select' | 'progress'
+  const [downloadDialog, setDownloadDialog] = useState<
+    'none' | 'select' | 'progress'
+  >('none');
+  const [downloadStatus, setDownloadStatus] = useState<
+    'idle' | 'downloading' | 'completed' | 'error'
+  >('idle');
   const [downloadProgress, setDownloadProgress] = useState(0);
-  const [downloadCurrentEpisode, setDownloadCurrentEpisode] = useState(1);
-  const [downloadTotalEpisodes, setDownloadTotalEpisodes] = useState(1);
+  const [downloadCurrentEpisode, setDownloadCurrentEpisode] = useState(0);
+  const [downloadTotalEpisodes, setDownloadTotalEpisodes] = useState(0);
   const [downloadCurrentPart, setDownloadCurrentPart] = useState(0);
   const [downloadTotalParts, setDownloadTotalParts] = useState(0);
-  const [downloadStatus, setDownloadStatus] = useState<
-    'idle' | 'downloading' | 'completed' | 'error' | 'paused'
-  >('idle');
+  const [downloadSpeedMBps, setDownloadSpeedMBps] = useState(0);
+  const [downloadConcurrency, setDownloadConcurrency] = useState(0);
   const [downloadErrorMessage, setDownloadErrorMessage] = useState<
     string | null
   >(null);
-
-  // 选择下载相关状态
-  const [showSelectDownload, setShowSelectDownload] = useState(false);
   const [selectedEpisodes, setSelectedEpisodes] = useState<number[]>([]);
-
-  // 下载控制器，用于暂停/恢复下载
   const downloadControllerRef = useRef<AbortController | null>(null);
+  // 记录本次下载的原始集数索引，供重试时使用
+  const lastDownloadIndicesRef = useRef<number[]>([]);
 
   // ----------------------------------------------------------------------------- 下载相关函数
   // -----------------------------------------------------------------------------
 
-  // 下载当前视频
-  const handleDownloadCurrent = async () => {
-    if (!videoUrl || !videoTitle) return;
+  /** 启动下载任务（单集或多集） */
+  const startDownload = async (episodeIndices: number[]) => {
+    if (!detail?.episodes || episodeIndices.length === 0) return;
+
+    // 记录本次下载的原始集数索引，供重试时使用
+    lastDownloadIndicesRef.current = episodeIndices;
+
+    // 取消上一次未完成的下载
+    downloadControllerRef.current?.abort();
+    const controller = new AbortController();
+    downloadControllerRef.current = controller;
+
+    setDownloadStatus('downloading');
+    setDownloadDialog('progress');
+    setDownloadErrorMessage(null);
+    setDownloadProgress(0);
+    setDownloadCurrentEpisode(0);
+    setDownloadTotalEpisodes(episodeIndices.length);
+    setDownloadCurrentPart(0);
+    setDownloadTotalParts(0);
+    setDownloadSpeedMBps(0);
+    setDownloadConcurrency(0);
 
     try {
-      // 如果正在下载，先暂停
-      if (downloadStatus === 'downloading') {
-        handlePauseDownload();
-        return;
-      }
-
-      // 如果已经暂停，恢复下载
-      if (downloadStatus === 'paused') {
-        handleResumeDownload();
-        return;
-      }
-
-      setDownloading(true);
-      setDownloadStatus('downloading');
-      setShowDownloadProgress(true);
-      setDownloadErrorMessage(null);
-      setDownloadCurrentEpisode(1);
-      setDownloadTotalEpisodes(1);
-      setDownloadProgress(0);
-
-      // 创建新的控制器
-      downloadControllerRef.current = new AbortController();
-      const signal = downloadControllerRef.current.signal;
-
-      const filename = `${videoTitle} - 第${currentEpisodeIndex + 1}集.mp4`;
-      await downloadVideo(
-        videoUrl,
-        filename,
-        (progress, current, total) => {
-          setDownloadProgress(progress);
-          setDownloadCurrentPart(current);
-          setDownloadTotalParts(total);
-        },
-        signal
-      );
-
-      setDownloadStatus('completed');
-      setTimeout(() => {
-        setShowDownloadProgress(false);
-        setDownloading(false);
-      }, 3000);
-    } catch (error) {
-      if (downloadStatus !== 'paused') {
-        console.error('下载失败:', error);
-        setDownloadStatus('error');
-        setDownloadErrorMessage(
-          error instanceof Error ? error.message : '下载失败'
+      if (episodeIndices.length === 1) {
+        // 单集下载
+        const idx = episodeIndices[0];
+        const url = detail.episodes[idx];
+        const filename = `${videoTitle}${
+          detail.episodes.length > 1 ? ` - 第${idx + 1}集` : ''
+        }.mp4`;
+        setDownloadCurrentEpisode(1);
+        await downloadVideo(
+          url,
+          filename,
+          (p) => {
+            setDownloadProgress(p.percent);
+            setDownloadCurrentPart(p.downloaded);
+            setDownloadTotalParts(p.total);
+            setDownloadSpeedMBps(p.speedMBps);
+            setDownloadConcurrency(p.concurrency);
+          },
+          controller.signal
         );
-      }
-      setDownloading(false);
-    }
-  };
-
-  // 下载整个合集
-  const handleDownloadAll = async () => {
-    if (!detail || !detail.episodes || detail.episodes.length === 0) return;
-
-    try {
-      // 如果正在下载，先暂停
-      if (downloadStatus === 'downloading') {
-        handlePauseDownload();
-        return;
-      }
-
-      // 如果已经暂停，恢复下载
-      if (downloadStatus === 'paused') {
-        handleResumeDownload();
-        return;
-      }
-
-      setDownloading(true);
-      setDownloadStatus('downloading');
-      setShowDownloadProgress(true);
-      setDownloadErrorMessage(null);
-      setDownloadCurrentEpisode(0);
-      setDownloadTotalEpisodes(detail.episodes.length);
-      setDownloadProgress(0);
-
-      // 创建新的控制器
-      downloadControllerRef.current = new AbortController();
-      const signal = downloadControllerRef.current.signal;
-
-      const baseFilename = `${detail.title}`;
-      const episodes = detail.episodes;
-      const titles = episodes.map((_, index) => `第${index + 1}集`);
-
-      await downloadPlaylist(
-        episodes,
-        titles,
-        baseFilename,
-        (currentEpisode, totalEpisodes, episodeProgress) => {
-          setDownloadCurrentEpisode(currentEpisode);
-          setDownloadTotalEpisodes(totalEpisodes);
-          setDownloadProgress(episodeProgress);
-        },
-        signal
-      );
-
-      setDownloadStatus('completed');
-      setTimeout(() => {
-        setShowDownloadProgress(false);
-        setDownloading(false);
-      }, 3000);
-    } catch (error) {
-      if (downloadStatus !== 'paused') {
-        console.error('下载合集失败:', error);
-        setDownloadStatus('error');
-        setDownloadErrorMessage(
-          error instanceof Error ? error.message : '下载合集失败'
-        );
-      }
-      setDownloading(false);
-    }
-  };
-
-  // 暂停下载
-  const handlePauseDownload = () => {
-    if (downloadStatus === 'downloading' && downloadControllerRef.current) {
-      downloadControllerRef.current.abort();
-      setDownloadStatus('paused');
-      setDownloading(false);
-    }
-  };
-
-  // 恢复下载
-  const handleResumeDownload = () => {
-    if (downloadStatus === 'paused') {
-      // 重置控制器
-      downloadControllerRef.current = null;
-
-      // 根据当前下载类型恢复
-      if (downloadTotalEpisodes === 1) {
-        handleDownloadCurrent();
       } else {
-        handleDownloadAll();
+        // 多集下载
+        const episodes = episodeIndices.map((i) => (detail.episodes ?? [])[i]);
+        const titles = episodeIndices.map((i) => `第${i + 1}集`);
+        await downloadPlaylist(
+          episodes,
+          titles,
+          videoTitle,
+          (cur, total, p) => {
+            setDownloadCurrentEpisode(cur);
+            setDownloadTotalEpisodes(total);
+            setDownloadProgress(p.percent);
+            setDownloadCurrentPart(p.downloaded);
+            setDownloadTotalParts(p.total);
+            setDownloadSpeedMBps(p.speedMBps);
+            setDownloadConcurrency(p.concurrency);
+          },
+          controller.signal
+        );
+      }
+
+      if (!controller.signal.aborted) {
+        setDownloadStatus('completed');
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        console.error('下载失败:', err);
+        setDownloadStatus('error');
+        setDownloadErrorMessage(
+          err instanceof Error ? err.message : '下载失败'
+        );
       }
     }
   };
 
-  // 关闭下载进度弹窗
-  const handleCloseDownloadProgress = () => {
-    if (downloading || downloadStatus === 'downloading') return; // 正在下载时不允许关闭
-
-    // 如果是暂停状态，先取消下载
-    if (downloadStatus === 'paused') {
-      setDownloadStatus('idle');
-    }
-
-    setShowDownloadProgress(false);
+  /** 取消当前下载 */
+  const handleCancelDownload = () => {
+    downloadControllerRef.current?.abort();
+    downloadControllerRef.current = null;
+    setDownloadStatus('idle');
+    setDownloadDialog('none');
   };
 
-  // 打开选择下载对话框
-  const handleOpenSelectDownload = () => {
+  /** 关闭进度弹窗（仅在非下载中状态允许） */
+  const handleCloseProgressDialog = () => {
+    if (downloadStatus === 'downloading') return;
+    setDownloadDialog('none');
+    setDownloadStatus('idle');
+  };
+
+  /** 打开集数选择对话框 */
+  const handleOpenDownloadDialog = () => {
+    // 单集视频直接下载
+    if (!detail?.episodes || detail.episodes.length <= 1) {
+      startDownload([currentEpisodeIndex]);
+      return;
+    }
     setSelectedEpisodes([]);
-    setShowSelectDownload(true);
+    setDownloadDialog('select');
   };
 
-  // 关闭选择下载对话框
-  const handleCloseSelectDownload = () => {
-    setShowSelectDownload(false);
+  /** 切换单集选中状态 */
+  const handleToggleEpisodeSelect = (idx: number) => {
+    setSelectedEpisodes((prev) =>
+      prev.includes(idx)
+        ? prev.filter((i) => i !== idx)
+        : [...prev, idx].sort((a, b) => a - b)
+    );
   };
 
-  // 切换集数选择状态
-  const handleToggleEpisodeSelect = (episodeIndex: number) => {
-    setSelectedEpisodes((prev) => {
-      if (prev.includes(episodeIndex)) {
-        return prev.filter((index) => index !== episodeIndex);
-      } else {
-        return [...prev, episodeIndex].sort((a, b) => a - b);
-      }
-    });
-  };
-
-  // 全选/取消全选
+  /** 全选 / 取消全选 */
   const handleToggleSelectAll = () => {
-    if (!detail || !detail.episodes) return;
-
-    if (selectedEpisodes.length === detail.episodes.length) {
-      // 取消全选
-      setSelectedEpisodes([]);
-    } else {
-      // 全选
-      setSelectedEpisodes(
-        Array.from({ length: detail.episodes.length }, (_, i) => i)
-      );
-    }
-  };
-
-  // 处理选择下载
-  const handleSelectDownload = async () => {
-    if (!detail || !detail.episodes || selectedEpisodes.length === 0) return;
-
-    try {
-      // 如果正在下载，先暂停
-      if (downloadStatus === 'downloading') {
-        handlePauseDownload();
-        return;
-      }
-
-      // 如果已经暂停，恢复下载
-      if (downloadStatus === 'paused') {
-        handleResumeDownload();
-        return;
-      }
-
-      setDownloading(true);
-      setDownloadStatus('downloading');
-      setShowDownloadProgress(true);
-      setShowSelectDownload(false);
-      setDownloadErrorMessage(null);
-      setDownloadCurrentEpisode(0);
-      setDownloadTotalEpisodes(selectedEpisodes.length);
-      setDownloadProgress(0);
-
-      // 创建新的控制器
-      downloadControllerRef.current = new AbortController();
-      const signal = downloadControllerRef.current.signal;
-
-      const baseFilename = `${detail.title}`;
-      // 只下载选中的集数
-      const episodes = selectedEpisodes.map(
-        (index) => detail.episodes?.[index] ?? ''
-      );
-      // 过滤掉可能的undefined值
-      const validEpisodes = episodes.filter((episode) => episode);
-      if (validEpisodes.length === 0) {
-        setDownloading(false);
-        setDownloadStatus('error');
-        setDownloadErrorMessage('没有选择有效的剧集');
-        return;
-      }
-      // 只保留有效剧集对应的标题
-      const validTitles = selectedEpisodes
-        .map((index, idx) => (validEpisodes[idx] ? `第${index + 1}集` : null))
-        .filter(Boolean) as string[];
-
-      await downloadPlaylist(
-        validEpisodes,
-        validTitles,
-        baseFilename,
-        (currentEpisode, totalEpisodes, episodeProgress) => {
-          setDownloadCurrentEpisode(currentEpisode);
-          setDownloadTotalEpisodes(totalEpisodes);
-          setDownloadProgress(episodeProgress);
-        },
-        signal
-      );
-
-      setDownloadStatus('completed');
-      setTimeout(() => {
-        setShowDownloadProgress(false);
-        setDownloading(false);
-      }, 3000);
-    } catch (error) {
-      if (downloadStatus !== 'paused') {
-        console.error('下载合集失败:', error);
-        setDownloadStatus('error');
-        setDownloadErrorMessage(
-          error instanceof Error ? error.message : '下载合集失败'
-        );
-      }
-      setDownloading(false);
-    }
+    if (!detail?.episodes) return;
+    const eps = detail.episodes;
+    setSelectedEpisodes((prev) =>
+      prev.length === eps.length
+        ? []
+        : Array.from({ length: eps.length }, (_, i) => i)
+    );
   };
 
   // -----------------------------------------------------------------------------
@@ -511,6 +363,37 @@ function PlayPageClient() {
     sources: SearchResult[]
   ): Promise<SearchResult> => {
     if (sources.length === 1) return sources[0];
+
+    // ── 优先使用测速缓存 ──────────────────────────────────────────────────────
+    // 先尝试读取已有缓存（不触发新测速）
+    let speedCache = getCachedSpeedtest();
+
+    if (speedCache && speedCache.length > 0) {
+      // 有缓存：直接按延迟排名选最优源，无需 m3u8 测速
+      const sorted = sortSourcesBySpeedCache(sources, speedCache);
+      console.log(
+        '[preferBestSource] 使用测速缓存，选择:',
+        sorted[0].source_name
+      );
+      // 后台异步刷新缓存（不阻塞播放）
+      runSpeedtestInBackground(true).catch(() => {});
+      return sorted[0];
+    }
+
+    // 无缓存：先做一次轻量服务端测速，再决定
+    setLoadingMessage('⚡ 正在测速站点...');
+    speedCache = await runSpeedtestInBackground(true);
+    if (speedCache && speedCache.length > 0) {
+      const sorted = sortSourcesBySpeedCache(sources, speedCache);
+      console.log(
+        '[preferBestSource] 服务端测速完成，选择:',
+        sorted[0].source_name
+      );
+      return sorted[0];
+    }
+
+    // ── 降级：服务端测速失败，回退到原有 m3u8 测速逻辑 ──────────────────────
+    setLoadingMessage('⚡ 正在优选最佳播放源...');
 
     // 将播放源均分为两批，并发测速各批，避免一次性过多请求
     const batchSize = Math.ceil(sources.length / 2);
@@ -724,21 +607,12 @@ function PlayPageClient() {
     }
   };
 
-  const ensureVideoSource = (video: HTMLVideoElement | null, url: string) => {
-    if (!video || !url) return;
-    const sources = Array.from(video.getElementsByTagName('source'));
-    const existed = sources.some((s) => s.src === url);
-    if (!existed) {
-      // 移除旧的 source，保持唯一
-      sources.forEach((s) => s.remove());
-      const sourceEl = document.createElement('source');
-      sourceEl.src = url;
-      video.appendChild(sourceEl);
-    }
-
-    // 始终允许远程播放（AirPlay / Cast）
+  const ensureVideoSource = (video: HTMLVideoElement | null, _url: string) => {
+    if (!video) return;
+    // HLS.js 通过 MediaSource 接管 <video>，不能再插入 <source> 元素，
+    // 否则浏览器会尝试原生加载 m3u8，与 HLS.js 冲突导致有声音没画面。
+    // 此函数仅保留 AirPlay / Cast 相关设置。
     video.disableRemotePlayback = false;
-    // 如果曾经有禁用属性，移除之
     if (video.hasAttribute('disableRemotePlayback')) {
       video.removeAttribute('disableRemotePlayback');
     }
@@ -905,7 +779,8 @@ function PlayPageClient() {
   useEffect(() => {
     const fetchSourceDetail = async (
       source: string,
-      id: string
+      id: string,
+      updateAvailable = true
     ): Promise<SearchResult[]> => {
       try {
         const detailResponse = await fetch(
@@ -915,7 +790,12 @@ function PlayPageClient() {
           throw new Error('获取视频详情失败');
         }
         const detailData = (await detailResponse.json()) as SearchResult;
-        setAvailableSources([detailData]);
+        if (updateAvailable) {
+          // 只在当前列表为空时才设置，避免覆盖已有的全量搜索结果
+          setAvailableSources((prev) =>
+            prev.length === 0 ? [detailData] : prev
+          );
+        }
         return [detailData];
       } catch (err) {
         console.error('获取视频详情失败:', err);
@@ -936,18 +816,81 @@ function PlayPageClient() {
         const data = await response.json();
 
         // 处理搜索结果，根据规则过滤
-        const results = data.results.filter(
+        const normalizeTitle = (t: string) =>
+          t.replaceAll(' ', '').toLowerCase();
+        const queryNorm = normalizeTitle(videoTitleRef.current);
+
+        const typeFilter = (result: SearchResult) => {
+          if (!searchType) return true;
+          // episodes 可能为空（搜索接口只返回摘要），用 type_name 辅助判断
+          const episodeCount = result.episodes.length;
+          const typeName = (result.type_name || '').toLowerCase();
+          const looksLikeMovie =
+            typeName.includes('电影') || typeName.includes('movie');
+          const looksLikeTv =
+            typeName.includes('电视') ||
+            typeName.includes('剧') ||
+            typeName.includes('综艺') ||
+            typeName.includes('动漫') ||
+            typeName.includes('tv');
+
+          if (searchType === 'movie') {
+            if (episodeCount === 1) return true;
+            if (episodeCount > 1) return false;
+            // episodes 为空：优先看 type_name，都不确定则放行
+            if (looksLikeMovie) return true;
+            if (looksLikeTv) return false;
+            return true; // 无法判断时放行，后续补全 episodes 再确认
+          }
+          if (searchType === 'tv') {
+            if (episodeCount > 1) return true;
+            if (episodeCount === 1) return false;
+            // episodes 为空：优先看 type_name
+            if (looksLikeTv) return true;
+            if (looksLikeMovie) return false;
+            return true;
+          }
+          return true;
+        };
+
+        const yearFilter = (result: SearchResult) =>
+          videoYearRef.current
+            ? result.year.toLowerCase() ===
+              videoYearRef.current.toLowerCase()
+            : true;
+
+        // 第一优先：标题严格相等（去空格小写）
+        let results = data.results.filter(
           (result: SearchResult) =>
-            result.title.replaceAll(' ', '').toLowerCase() ===
-              videoTitleRef.current.replaceAll(' ', '').toLowerCase() &&
-            (videoYearRef.current
-              ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
-              : true) &&
-            (searchType
-              ? (searchType === 'tv' && result.episodes.length > 1) ||
-                (searchType === 'movie' && result.episodes.length === 1)
-              : true)
+            normalizeTitle(result.title) === queryNorm &&
+            yearFilter(result) &&
+            typeFilter(result)
         );
+
+        // 降级：标题互相包含（处理「流浪地球2」vs「流浪地球 2」等差异）
+        if (results.length === 0) {
+          results = data.results.filter(
+            (result: SearchResult) => {
+              const rNorm = normalizeTitle(result.title);
+              const titleMatch =
+                rNorm.includes(queryNorm) || queryNorm.includes(rNorm);
+              return titleMatch && yearFilter(result) && typeFilter(result);
+            }
+          );
+        }
+
+        // 再降级：忽略年份限制，只匹配标题（年份数据可能不一致）
+        if (results.length === 0 && videoYearRef.current) {
+          results = data.results.filter((result: SearchResult) => {
+            const rNorm = normalizeTitle(result.title);
+            const titleMatch =
+              normalizeTitle(result.title) === queryNorm ||
+              rNorm.includes(queryNorm) ||
+              queryNorm.includes(rNorm);
+            return titleMatch && typeFilter(result);
+          });
+        }
+
         setAvailableSources(results);
         return results;
       } catch (err) {
@@ -966,23 +909,106 @@ function PlayPageClient() {
         return;
       }
       setLoading(true);
-      setLoadingStage(currentSource && currentId ? 'fetching' : 'searching');
-      setLoadingMessage(
-        currentSource && currentId
-          ? '🎬 正在获取视频详情...'
-          : '🔍 正在搜索播放源...'
-      );
+
+      // ── 快速路径：已有 source+id ────────────────────────────────────────────
+      // 并行：直接取当前源详情（快速起播）+ 全量搜索（供优选和换源面板）
+      if (currentSource && currentId) {
+        setLoadingStage('fetching');
+        setLoadingMessage('🎬 正在获取视频详情...');
+
+        const [sourcesInfo, allSources] = await Promise.all([
+          fetchSourceDetail(currentSource, currentId, false),
+          fetchSourcesData(searchTitle || videoTitle).catch(() => [] as SearchResult[]),
+        ]);
+
+        if (sourcesInfo.length === 0) {
+          setError('未找到匹配结果');
+          setLoading(false);
+          return;
+        }
+
+        // 有多个源且开启优选时，从全量结果里选最优源
+        let detailData = sourcesInfo[0];
+        if (optimizationEnabled && allSources.length > 1) {
+          setLoadingStage('preferring');
+          setLoadingMessage('⚡ 正在优选最佳播放源...');
+          const best = await preferBestSource(allSources);
+          // 如果优选出的源和当前源不同，需要补全详情
+          if (best.source !== currentSource || best.id !== currentId) {
+            if (best.episodes.length === 0) {
+              try {
+                const r = await fetch(`/api/detail?source=${best.source}&id=${best.id}`);
+                if (r.ok) {
+                  const full = (await r.json()) as SearchResult;
+                  if (full.episodes.length > 0) detailData = { ...best, ...full };
+                  else detailData = best;
+                } else {
+                  detailData = best;
+                }
+              } catch {
+                detailData = best;
+              }
+            } else {
+              detailData = best;
+            }
+          }
+          // 更新换源面板（已有全量结果）
+          setAvailableSources(allSources);
+        } else {
+          // 单源或关闭优选：直接用当前源，换源面板用全量结果
+          setAvailableSources(allSources.length > 0 ? allSources : sourcesInfo);
+        }
+
+        // 并行读取播放记录和跳过配置
+        const [playRecord, skipCfg] = await Promise.all([
+          getAllPlayRecords().catch(() => ({})),
+          getSkipConfig(detailData.source, detailData.id).catch(() => null),
+        ]);
+
+        // 应用播放记录
+        const key = generateStorageKey(detailData.source, detailData.id);
+        const record = (playRecord as Record<string, any>)[key];
+        if (record) {
+          const targetIndex = record.index - 1;
+          if (targetIndex !== currentEpisodeIndex) {
+            setCurrentEpisodeIndex(targetIndex);
+          }
+          resumeTimeRef.current = record.play_time;
+        }
+
+        // 应用跳过配置
+        if (skipCfg) {
+          setSkipConfig(skipCfg);
+        }
+
+        setCurrentSource(detailData.source);
+        setCurrentId(detailData.id);
+        setVideoYear(detailData.year);
+        setVideoTitle(detailData.title || videoTitleRef.current);
+        setVideoCover(detailData.poster);
+        setDetail(detailData);
+        if (currentEpisodeIndex >= detailData.episodes.length) {
+          setCurrentEpisodeIndex(0);
+        }
+
+        const newUrl = new URL(window.location.href);
+        newUrl.searchParams.set('source', detailData.source);
+        newUrl.searchParams.set('id', detailData.id);
+        newUrl.searchParams.set('year', detailData.year);
+        newUrl.searchParams.set('title', detailData.title);
+        newUrl.searchParams.delete('prefer');
+        window.history.replaceState({}, '', newUrl.toString());
+
+        setLoadingStage('ready');
+        setLoading(false);
+        return;
+      }
+
+      // ── 常规路径：需要搜索或优选 ────────────────────────────────────────────
+      setLoadingStage('searching');
+      setLoadingMessage('🔍 正在搜索播放源...');
 
       let sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
-      if (
-        currentSource &&
-        currentId &&
-        !sourcesInfo.some(
-          (source) => source.source === currentSource && source.id === currentId
-        )
-      ) {
-        sourcesInfo = await fetchSourceDetail(currentSource, currentId);
-      }
       if (sourcesInfo.length === 0) {
         setError('未找到匹配结果');
         setLoading(false);
@@ -990,25 +1016,9 @@ function PlayPageClient() {
       }
 
       let detailData: SearchResult = sourcesInfo[0];
-      // 指定源和id且无需优选
-      if (currentSource && currentId && !needPreferRef.current) {
-        const target = sourcesInfo.find(
-          (source) => source.source === currentSource && source.id === currentId
-        );
-        if (target) {
-          detailData = target;
-        } else {
-          setError('未找到匹配结果');
-          setLoading(false);
-          return;
-        }
-      }
 
-      // 未指定源和 id 或需要优选，且开启优选开关
-      if (
-        (!currentSource || !currentId || needPreferRef.current) &&
-        optimizationEnabled
-      ) {
+      // 有多个源且开启优选时，选最优源
+      if (optimizationEnabled && sourcesInfo.length > 1) {
         setLoadingStage('preferring');
         setLoadingMessage('⚡ 正在优选最佳播放源...');
 
@@ -1016,6 +1026,25 @@ function PlayPageClient() {
       }
 
       console.log(detailData.source, detailData.id);
+
+      // 搜索接口返回的 episodes 可能为空（只有摘要），需要补全详情
+      if (detailData.episodes.length === 0) {
+        setLoadingStage('fetching');
+        setLoadingMessage('🎬 正在获取视频详情...');
+        try {
+          const detailResponse = await fetch(
+            `/api/detail?source=${detailData.source}&id=${detailData.id}`
+          );
+          if (detailResponse.ok) {
+            const fullDetail = (await detailResponse.json()) as SearchResult;
+            if (fullDetail.episodes.length > 0) {
+              detailData = { ...detailData, ...fullDetail };
+            }
+          }
+        } catch {
+          // 补全失败时继续用原数据
+        }
+      }
 
       setNeedPrefer(false);
       setCurrentSource(detailData.source);
@@ -1026,6 +1055,25 @@ function PlayPageClient() {
       setDetail(detailData);
       if (currentEpisodeIndex >= detailData.episodes.length) {
         setCurrentEpisodeIndex(0);
+      }
+
+      // 并行读取播放记录和跳过配置
+      const [playRecord, skipCfg] = await Promise.all([
+        getAllPlayRecords().catch(() => ({})),
+        getSkipConfig(detailData.source, detailData.id).catch(() => null),
+      ]);
+
+      const recKey = generateStorageKey(detailData.source, detailData.id);
+      const record = (playRecord as Record<string, any>)[recKey];
+      if (record) {
+        const targetIndex = record.index - 1;
+        if (targetIndex !== currentEpisodeIndex) {
+          setCurrentEpisodeIndex(targetIndex);
+        }
+        resumeTimeRef.current = record.play_time;
+      }
+      if (skipCfg) {
+        setSkipConfig(skipCfg);
       }
 
       // 规范URL参数
@@ -1040,63 +1088,10 @@ function PlayPageClient() {
       setLoadingStage('ready');
       setLoadingMessage('✨ 准备就绪，即将开始播放...');
 
-      // 短暂延迟让用户看到完成状态
-      setTimeout(() => {
-        setLoading(false);
-      }, 1000);
+      setLoading(false);
     };
 
     initAll();
-  }, []);
-
-  // 播放记录处理
-  useEffect(() => {
-    // 仅在初次挂载时检查播放记录
-    const initFromHistory = async () => {
-      if (!currentSource || !currentId) return;
-
-      try {
-        const allRecords = await getAllPlayRecords();
-        const key = generateStorageKey(currentSource, currentId);
-        const record = allRecords[key];
-
-        if (record) {
-          const targetIndex = record.index - 1;
-          const targetTime = record.play_time;
-
-          // 更新当前选集索引
-          if (targetIndex !== currentEpisodeIndex) {
-            setCurrentEpisodeIndex(targetIndex);
-          }
-
-          // 保存待恢复的播放进度，待播放器就绪后跳转
-          resumeTimeRef.current = targetTime;
-        }
-      } catch (err) {
-        console.error('读取播放记录失败:', err);
-      }
-    };
-
-    initFromHistory();
-  }, []);
-
-  // 跳过片头片尾配置处理
-  useEffect(() => {
-    // 仅在初次挂载时检查跳过片头片尾配置
-    const initSkipConfig = async () => {
-      if (!currentSource || !currentId) return;
-
-      try {
-        const config = await getSkipConfig(currentSource, currentId);
-        if (config) {
-          setSkipConfig(config);
-        }
-      } catch (err) {
-        console.error('读取跳过片头片尾配置失败:', err);
-      }
-    };
-
-    initSkipConfig();
   }, []);
 
   // 处理换源
@@ -1564,9 +1559,7 @@ function PlayPageClient() {
         fastForward: true,
         autoOrientation: true,
         lock: true,
-        moreVideoAttr: {
-          crossOrigin: 'anonymous',
-        },
+        moreVideoAttr: {},
         // HLS 支持配置
         customType: {
           m3u8: function (video: HTMLVideoElement, url: string) {
@@ -1579,14 +1572,19 @@ function PlayPageClient() {
               video.hls.destroy();
             }
             const hls = new Hls({
-              debug: false, // 关闭日志
+              debug: false,
               enableWorker: true, // WebWorker 解码，降低主线程压力
-              lowLatencyMode: true, // 开启低延迟 LL-HLS
+              lowLatencyMode: false, // VOD 不需要 LL-HLS，开启反而影响缓冲策略
 
-              /* 缓冲/内存相关 */
-              maxBufferLength: 30, // 前向缓冲最大 30s，过大容易导致高延迟
-              backBufferLength: 30, // 仅保留 30s 已播放内容，避免内存占用
-              maxBufferSize: 60 * 1000 * 1000, // 约 60MB，超出后触发清理
+              /* 缓冲策略 —— 激进预加载，减少卡顿 */
+              maxBufferLength: 60, // 前向缓冲最大 60s
+              maxMaxBufferLength: 120, // 网络好时允许缓冲到 120s
+              backBufferLength: 10, // 已播放内容只保留 10s，节省内存
+              maxBufferSize: 100 * 1000 * 1000, // 约 100MB
+
+              /* 首帧加速 */
+              startLevel: -1, // 自动选择起始质量（不强制从最低开始）
+              abrEwmaDefaultEstimate: 2 * 1000 * 1000, // ABR 初始带宽估算 2Mbps，避免从最低质量起步
 
               /* 自定义loader */
               loader: blockAdEnabledRef.current
@@ -2211,44 +2209,14 @@ function PlayPageClient() {
 
                 {/* 下载操作按钮 */}
                 <div className='flex gap-3 w-full md:w-auto'>
-                  {/* 下载当前视频按钮 */}
                   <button
-                    onClick={handleDownloadCurrent}
-                    className='flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-lg font-medium hover:from-blue-600 hover:to-indigo-700 transform hover:scale-105 transition-all duration-200 shadow-lg hover:shadow-xl'
+                    onClick={handleOpenDownloadDialog}
+                    disabled={downloadStatus === 'downloading'}
+                    className='flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-lg font-medium hover:from-blue-600 hover:to-indigo-700 transform hover:scale-105 transition-all duration-200 shadow-lg hover:shadow-xl disabled:opacity-60 disabled:cursor-not-allowed disabled:transform-none'
                   >
                     <Download size={18} />
-                    {downloadStatus === 'downloading'
-                      ? '暂停'
-                      : downloadStatus === 'paused'
-                      ? '继续'
-                      : '下载当前'}
+                    {downloadStatus === 'downloading' ? '下载中...' : '下载'}
                   </button>
-
-                  {/* 下载全部合集按钮 */}
-                  {detail && detail.episodes.length > 1 && (
-                    <button
-                      onClick={handleDownloadAll}
-                      className='flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-600 text-white rounded-lg font-medium hover:from-purple-600 hover:to-pink-700 transform hover:scale-105 transition-all duration-200 shadow-lg hover:shadow-xl'
-                    >
-                      <Download size={18} />
-                      {downloadStatus === 'downloading'
-                        ? '暂停'
-                        : downloadStatus === 'paused'
-                        ? '继续'
-                        : `下载全部 (${detail.episodes.length}集)`}
-                    </button>
-                  )}
-
-                  {/* 选择下载按钮 */}
-                  {detail && detail.episodes.length > 1 && (
-                    <button
-                      onClick={handleOpenSelectDownload}
-                      className='flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-green-500 to-teal-600 text-white rounded-lg font-medium hover:from-green-600 hover:to-teal-700 transform hover:scale-105 transition-all duration-200 shadow-lg hover:shadow-xl'
-                    >
-                      <Download size={18} />
-                      选择下载
-                    </button>
-                  )}
                 </div>
               </div>
 
@@ -2302,228 +2270,203 @@ function PlayPageClient() {
         </div>
       </div>
 
-      {/* 下载进度弹窗 */}
-      {showDownloadProgress && (
+      {/* ── 集数选择对话框 ── */}
+      {downloadDialog === 'select' && detail?.episodes && (
         <div className='fixed inset-0 bg-black/70 backdrop-blur-sm z-[1000] flex items-center justify-center p-4'>
-          <div className='bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-md w-full mx-auto overflow-hidden'>
-            {/* 弹窗头部 */}
-            <div className='p-6 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between'>
-              <h2 className='text-xl font-bold text-gray-900 dark:text-white'>
-                下载进度
-              </h2>
-              <button
-                onClick={handleCloseDownloadProgress}
-                disabled={downloading}
-                className='text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed'
-              >
-                <X size={20} />
-              </button>
-            </div>
-
-            {/* 弹窗内容 */}
-            <div className='p-6'>
-              {/* 状态图标 */}
-              <div className='flex justify-center mb-6'>
-                <div
-                  className={`w-16 h-16 rounded-full flex items-center justify-center ${
-                    downloadStatus === 'downloading'
-                      ? 'bg-blue-100 dark:bg-blue-900/30 animate-pulse'
-                      : downloadStatus === 'completed'
-                      ? 'bg-green-100 dark:bg-green-900/30'
-                      : downloadStatus === 'error'
-                      ? 'bg-red-100 dark:bg-red-900/30'
-                      : 'bg-yellow-100 dark:bg-yellow-900/30'
-                  }`}
-                >
-                  {downloadStatus === 'downloading' && (
-                    <Download
-                      size={32}
-                      className='text-blue-500 dark:text-blue-400'
-                    />
-                  )}
-                  {downloadStatus === 'completed' && (
-                    <CheckCircle
-                      size={32}
-                      className='text-green-500 dark:text-green-400'
-                    />
-                  )}
-                  {downloadStatus === 'error' && (
-                    <AlertCircle
-                      size={32}
-                      className='text-red-500 dark:text-red-400'
-                    />
-                  )}
-                  {downloadStatus === 'paused' && (
-                    <Pause
-                      size={32}
-                      className='text-yellow-500 dark:text-yellow-400'
-                    />
-                  )}
-                </div>
-              </div>
-
-              {/* 下载信息 */}
-              {downloadTotalEpisodes > 1 ? (
-                <div className='text-center mb-6'>
-                  <p className='text-gray-700 dark:text-gray-300 font-medium mb-2'>
-                    正在下载 {videoTitle}
-                  </p>
-                  <p className='text-gray-500 dark:text-gray-400'>
-                    第 {downloadCurrentEpisode} / {downloadTotalEpisodes} 集
-                  </p>
-                </div>
-              ) : (
-                <div className='text-center mb-6'>
-                  <p className='text-gray-700 dark:text-gray-300 font-medium'>
-                    正在下载 {videoTitle}
-                  </p>
-                </div>
-              )}
-
-              {/* 进度条 */}
-              <div className='mb-4'>
-                <div className='w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 overflow-hidden'>
-                  <div
-                    className={`h-full bg-gradient-to-r from-blue-500 to-indigo-600 rounded-full transition-all duration-300 ease-in-out ${
-                      downloadStatus === 'completed'
-                        ? 'bg-green-500'
-                        : downloadStatus === 'paused'
-                        ? 'bg-yellow-500'
-                        : ''
-                    }`}
-                    style={{ width: `${downloadProgress}%` }}
-                  ></div>
-                </div>
-                <div className='flex justify-between text-sm mt-2'>
-                  <span className='text-gray-500 dark:text-gray-400'>
-                    {downloadStatus === 'completed'
-                      ? '已完成'
-                      : downloadStatus === 'paused'
-                      ? '已暂停'
-                      : `${downloadProgress}%`}
-                  </span>
-                  {downloading && downloadTotalParts > 0 && (
-                    <span className='text-gray-500 dark:text-gray-400'>
-                      {downloadCurrentPart} / {downloadTotalParts}
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              {/* 错误信息 */}
-              {downloadStatus === 'error' && downloadErrorMessage && (
-                <div className='bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 mb-6'>
-                  <p className='text-red-600 dark:text-red-400 text-sm'>
-                    {downloadErrorMessage}
-                  </p>
-                </div>
-              )}
-
-              {/* 操作按钮 */}
-              <div className='flex gap-3'>
-                {downloadStatus === 'downloading' && (
-                  <button
-                    onClick={handlePauseDownload}
-                    className='flex-1 px-4 py-2 bg-yellow-500 text-white rounded-lg font-medium hover:bg-yellow-600 transition-colors'
-                  >
-                    暂停
-                  </button>
-                )}
-
-                {downloadStatus === 'paused' && (
-                  <button
-                    onClick={handleResumeDownload}
-                    className='flex-1 px-4 py-2 bg-green-500 text-white rounded-lg font-medium hover:bg-green-600 transition-colors'
-                  >
-                    继续
-                  </button>
-                )}
-
-                <button
-                  onClick={handleCloseDownloadProgress}
-                  disabled={downloading || downloadStatus === 'downloading'}
-                  className={`flex-1 px-4 py-2 font-medium rounded-lg transition-colors ${
-                    downloadStatus === 'completed'
-                      ? 'bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700'
-                      : 'bg-gradient-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700'
-                  }`}
-                >
-                  {downloadStatus === 'completed' ? '完成' : '关闭'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 选择下载对话框 */}
-      {showSelectDownload && detail && detail.episodes && (
-        <div className='fixed inset-0 bg-black/70 backdrop-blur-sm z-[1000] flex items-center justify-center p-4'>
-          <div className='bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-3xl w-full mx-auto overflow-hidden'>
-            {/* 弹窗头部 */}
-            <div className='p-6 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between'>
-              <h2 className='text-xl font-bold text-gray-900 dark:text-white'>
+          <div className='bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-2xl w-full mx-auto overflow-hidden flex flex-col max-h-[90vh]'>
+            {/* 头部 */}
+            <div className='p-5 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between flex-shrink-0'>
+              <h2 className='text-lg font-bold text-gray-900 dark:text-white'>
                 选择下载集数
               </h2>
               <button
-                onClick={handleCloseSelectDownload}
+                onClick={() => setDownloadDialog('none')}
                 className='text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors'
               >
                 <X size={20} />
               </button>
             </div>
 
-            {/* 弹窗内容 */}
-            <div className='p-6'>
-              {/* 全选/取消全选按钮 */}
-              <div className='flex items-center justify-between mb-6'>
+            {/* 内容 */}
+            <div className='p-5 flex-1 overflow-y-auto'>
+              {/* 快捷操作行 */}
+              <div className='flex items-center gap-3 mb-4 flex-wrap'>
+                {/* 下载当前集 */}
+                <button
+                  onClick={() => startDownload([currentEpisodeIndex])}
+                  className='flex items-center gap-1.5 px-3 py-1.5 bg-blue-500 text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-colors'
+                >
+                  <Download size={14} />
+                  当前集（第{currentEpisodeIndex + 1}集）
+                </button>
+                {/* 全选/取消全选 */}
                 <button
                   onClick={handleToggleSelectAll}
-                  className='flex items-center gap-2 px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg font-medium hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors'
+                  className='flex items-center gap-1.5 px-3 py-1.5 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg text-sm font-medium hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors'
                 >
-                  <span>
-                    {selectedEpisodes.length === detail.episodes.length
-                      ? '取消全选'
-                      : '全选'}
+                  {selectedEpisodes.length === detail.episodes.length
+                    ? '取消全选'
+                    : '全选'}
+                  <span className='opacity-60 text-xs'>
+                    ({selectedEpisodes.length}/{detail.episodes.length})
                   </span>
-                  <span className='text-sm opacity-70'>
-                    ({selectedEpisodes.length} / {detail.episodes.length})
-                  </span>
-                </button>
-                <button
-                  onClick={handleSelectDownload}
-                  disabled={selectedEpisodes.length === 0}
-                  className='flex items-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg font-medium hover:bg-green-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed'
-                >
-                  <Download size={18} />
-                  开始下载
                 </button>
               </div>
 
-              {/* 集数选择网格 */}
-              <div className='grid grid-cols-8 md:grid-cols-12 gap-2 max-h-[400px] overflow-y-auto'>
-                {detail.episodes.map((_, episodeIndex) => {
-                  const isSelected = selectedEpisodes.includes(episodeIndex);
+              {/* 集数网格 */}
+              <div className='grid grid-cols-8 sm:grid-cols-10 md:grid-cols-12 gap-2'>
+                {detail.episodes.map((_, idx) => {
+                  const selected = selectedEpisodes.includes(idx);
+                  const isCurrent = idx === currentEpisodeIndex;
                   return (
                     <button
-                      key={episodeIndex}
-                      onClick={() => handleToggleEpisodeSelect(episodeIndex)}
-                      className={`py-2 px-3 rounded-lg font-medium transition-all duration-200 text-sm flex items-center justify-center
+                      key={idx}
+                      onClick={() => handleToggleEpisodeSelect(idx)}
+                      className={`py-2 rounded-lg text-sm font-medium transition-all duration-150 relative
                         ${
-                          isSelected
-                            ? 'bg-green-500 text-white shadow-lg shadow-green-500/25 dark:bg-green-600'
-                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300 hover:scale-105 dark:bg-white/10 dark:text-gray-300 dark:hover:bg-white/20'
-                        }
-                      `}
+                          selected
+                            ? 'bg-blue-500 text-white shadow-md shadow-blue-500/30 dark:bg-blue-600'
+                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-white/10 dark:text-gray-300 dark:hover:bg-white/20'
+                        }`}
                     >
-                      {episodeIndex + 1}
+                      {idx + 1}
+                      {isCurrent && (
+                        <span className='absolute -top-1 -right-1 w-2 h-2 bg-green-400 rounded-full border border-white dark:border-gray-800' />
+                      )}
                     </button>
                   );
                 })}
               </div>
             </div>
+
+            {/* 底部操作 */}
+            <div className='p-5 border-t border-gray-200 dark:border-gray-700 flex gap-3 flex-shrink-0'>
+              <button
+                onClick={() => setDownloadDialog('none')}
+                className='flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors'
+              >
+                取消
+              </button>
+              <button
+                onClick={() =>
+                  selectedEpisodes.length > 0 && startDownload(selectedEpisodes)
+                }
+                disabled={selectedEpisodes.length === 0}
+                className='flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed'
+              >
+                <Download size={16} />
+                下载选中 ({selectedEpisodes.length} 集)
+              </button>
+            </div>
           </div>
         </div>
+      )}
+
+      {/* ── 下载进度：悬浮条（下载中可最小化）/ 结果弹窗（完成/错误）── */}
+      {downloadDialog === 'progress' && (
+        <>
+          {/* 下载中：底部悬浮条，不遮挡视频 */}
+          {downloadStatus === 'downloading' && (
+            <div className='fixed bottom-4 left-1/2 -translate-x-1/2 z-[1000] w-full max-w-sm px-3'>
+              <div className='bg-gray-900/95 dark:bg-gray-800/95 backdrop-blur-md rounded-2xl shadow-2xl border border-white/10 overflow-hidden'>
+                {/* 顶部标题栏 */}
+                <div className='flex items-center gap-3 px-4 py-3'>
+                  <div className='w-7 h-7 rounded-full bg-blue-500/20 flex items-center justify-center flex-shrink-0 animate-pulse'>
+                    <Download size={14} className='text-blue-400' />
+                  </div>
+                  <div className='flex-1 min-w-0'>
+                    <p className='text-sm font-medium text-white truncate'>
+                      {downloadTotalEpisodes > 1
+                        ? `下载中 · 第 ${downloadCurrentEpisode}/${downloadTotalEpisodes} 集`
+                        : `下载中 · ${videoTitle}`}
+                    </p>
+                    <div className='flex items-center gap-2 mt-0.5'>
+                      <span className='text-xs font-mono text-blue-400'>
+                        {downloadSpeedMBps >= 1
+                          ? `${downloadSpeedMBps.toFixed(1)} MB/s`
+                          : `${(downloadSpeedMBps * 1024).toFixed(0)} KB/s`}
+                      </span>
+                      <span className='text-xs text-gray-500'>·</span>
+                      <span className='text-xs text-gray-400'>
+                        {downloadConcurrency} 线程
+                      </span>
+                      <span className='text-xs text-gray-500'>·</span>
+                      <span className='text-xs text-gray-400'>
+                        {downloadCurrentPart}/{downloadTotalParts} 分片
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleCancelDownload}
+                    className='flex-shrink-0 w-7 h-7 rounded-full bg-red-500/20 hover:bg-red-500/40 flex items-center justify-center transition-colors'
+                    title='取消下载'
+                  >
+                    <X size={13} className='text-red-400' />
+                  </button>
+                </div>
+                {/* 进度条 */}
+                <div className='h-1 bg-gray-700'>
+                  <div
+                    className='h-full bg-blue-500 transition-all duration-300'
+                    style={{ width: `${downloadProgress}%` }}
+                  />
+                </div>
+                <div className='px-4 py-1.5 flex justify-between text-xs text-gray-500'>
+                  <span>{downloadProgress}%</span>
+                  <span>请勿关闭页面</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 完成 / 错误：小型居中弹窗 */}
+          {(downloadStatus === 'completed' || downloadStatus === 'error') && (
+            <div className='fixed inset-0 bg-black/50 backdrop-blur-sm z-[1000] flex items-center justify-center p-4'>
+              <div className='bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-xs mx-auto overflow-hidden'>
+                <div className='p-6 text-center'>
+                  {/* 图标 */}
+                  <div className={`w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4 ${
+                    downloadStatus === 'completed'
+                      ? 'bg-green-100 dark:bg-green-900/30'
+                      : 'bg-red-100 dark:bg-red-900/30'
+                  }`}>
+                    {downloadStatus === 'completed'
+                      ? <CheckCircle size={28} className='text-green-500' />
+                      : <AlertCircle size={28} className='text-red-500' />}
+                  </div>
+                  <p className='font-semibold text-gray-900 dark:text-white mb-1'>
+                    {downloadStatus === 'completed' ? '下载完成' : '下载失败'}
+                  </p>
+                  {downloadStatus === 'error' && downloadErrorMessage && (
+                    <p className='text-xs text-red-500 dark:text-red-400 mt-2 mb-3 break-all'>
+                      {downloadErrorMessage}
+                    </p>
+                  )}
+                </div>
+                <div className='px-6 pb-6 flex gap-3'>
+                  <button
+                    onClick={handleCloseProgressDialog}
+                    className={`flex-1 py-2 rounded-xl font-medium text-sm text-white transition-colors ${
+                      downloadStatus === 'completed'
+                        ? 'bg-green-500 hover:bg-green-600'
+                        : 'bg-gray-500 hover:bg-gray-600'
+                    }`}
+                  >
+                    {downloadStatus === 'completed' ? '完成' : '关闭'}
+                  </button>
+                  {downloadStatus === 'error' && (
+                    <button
+                      onClick={() => startDownload(lastDownloadIndicesRef.current)}
+                      className='flex-1 py-2 rounded-xl font-medium text-sm text-white bg-blue-500 hover:bg-blue-600 transition-colors'
+                    >
+                      重试
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </PageLayout>
   );
