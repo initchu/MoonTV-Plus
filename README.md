@@ -173,14 +173,6 @@ pnpm start
 4. 点击部署按钮
 5. 等待部署完成
 
-### Cloudflare Pages 部署
-
-```bash
-pnpm pages:build
-```
-
-然后按照 Cloudflare Pages 部署流程上传构建产物。
-
 ### 本地部署
 
 ```bash

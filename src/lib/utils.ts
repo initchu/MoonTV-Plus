@@ -411,6 +411,7 @@ async function runSegmentDownloads(
   const worker = async () => {
     activeWorkers++;
     try {
+      // eslint-disable-next-line no-constant-condition
       while (true) {
         if (signal?.aborted) return;
         const pos = queuePos++;
@@ -468,7 +469,7 @@ async function runSegmentDownloads(
     while (!signal?.aborted) {
       // 补充 worker 直到达到目标并发数
       while (activeWorkers < targetConcurrency && queuePos < total && !signal?.aborted) {
-        worker().catch(() => {}); // 错误由 Promise.all 捕获
+        worker().catch((_e) => { /* 错误由 Promise.all 捕获 */ });
       }
       // 所有分片已分配完，退出调度
       if (queuePos >= total) break;

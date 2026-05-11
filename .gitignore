@@ -69,4 +69,6 @@ logs/
 *.tmp
 *.temp
 .cache/
-.trae/
+
+# Kiro
+.kiro/memory.md

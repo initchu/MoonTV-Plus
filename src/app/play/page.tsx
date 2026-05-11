@@ -376,7 +376,7 @@ function PlayPageClient() {
         sorted[0].source_name
       );
       // 后台异步刷新缓存（不阻塞播放）
-      runSpeedtestInBackground(true).catch(() => {});
+      runSpeedtestInBackground(true).catch((_e) => { /* 后台刷新，忽略错误 */ });
       return sorted[0];
     }
 
@@ -1008,7 +1008,7 @@ function PlayPageClient() {
       setLoadingStage('searching');
       setLoadingMessage('🔍 正在搜索播放源...');
 
-      let sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
+      const sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
       if (sourcesInfo.length === 0) {
         setError('未找到匹配结果');
         setLoading(false);
